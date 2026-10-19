@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WeChat Bridge",
+    "description": "Exposes the locally signed-in WeChat desktop client as tools: read chats and messages from the decrypted local database, send through UI Automation, plus a new-message cursor for auto-replies."
+  }
+}

@@ -1,0 +1,12 @@
+# 运行时状态：发送账本、游标、真实聊天内容。绝不提交。
+sidecar/.state/
+sidecar/wechatauto_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/

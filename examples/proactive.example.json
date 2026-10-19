@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "minMinutesBetween": 90,
+  "dailyCap": 6,
+  "recentAvoid": 5,
+  "note": "没人说话时主动发一句的节流：同一会话距上次发言至少 minMinutesBetween 分钟、当天不超过 dailyCap 条、不许重复最近 recentAvoid 条。时段由 autoreply.json 的 activeWindow 统一管，这里不再单列。"
+}

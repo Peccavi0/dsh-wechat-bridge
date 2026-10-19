@@ -1,0 +1,43 @@
+{
+  "name": "@local/dsh-wechat-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness bundle that exposes the locally signed-in WeChat desktop client as bounded tools: read chats from the decrypted local database, send through UI Automation, plus a new-message cursor and rate gates for auto-replies.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "wechat",
+    "weixin",
+    "automation",
+    "uiautomation",
+    "auto-reply"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Peccavi0/dsh-wechat-bridge.git"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "sidecar/wechat_bridge.py",
+    "AUTOREPLY.md",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

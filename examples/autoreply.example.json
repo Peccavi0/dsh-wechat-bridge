@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "activeWindow": ["07:00", "01:00"],
+  "cadenceMinutes": 3,
+  "whitelist": ["<会话 username，例如 12345678@chatroom 或 wxid_xxxx>"],
+  "selfAliases": ["<你的群昵称>", "<你的微信昵称>", "<别人对你的常用称呼>"],
+  "whitelistDisplay": {
+    "<会话 username>": "<给人看的名字，可留空>"
+  },
+  "groupMode": "at-only",
+  "maxChatsPerRound": 3,
+  "minMinutesBetweenReplies": 15,
+  "skipIfLastMessageIsMine": true,
+  "maxContextMessages": 15,
+  "rules": "AUTOREPLY.md",
+  "note": "whitelist 用 username：群名带 emoji 或特殊符号时，按名字打不开会话，桥会自动换成显示名再去驱动界面。groupMode=all 表示群里没 @ 也搭话，at-only 只回 @。activeWindow 可以跨午夜。enabled=false 时巡检第一行就退出。"
+}

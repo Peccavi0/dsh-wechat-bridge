@@ -1,0 +1,3 @@
+- insert:
+    - id: wechat-bridge
+      name: '@local/dsh-wechat-bridge'
