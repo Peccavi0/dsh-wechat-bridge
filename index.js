@@ -564,8 +564,9 @@ export function apply(ctx, config = {}) {
       '第一次遇到某个会话只建基线、不返回历史，所以不会把陈年旧消息当新消息回。' +
       '默认只看有未读的会话；给 chats 就只盯这几个。' +
       '拿到的每条都带 chat.username，回的时候把它传给 wechat_send 最稳。' +
-      '返回里还有一个 proactive 闸门：它按「距上次发言多久 / 今天发了几条 / 在不在时段内」判断现在能不能主动发一句（群安静时用），' +
-      '判据全部来自磁盘账本，不靠记忆；allowed=false 就照 reason 停手。' +
+      '返回里有两个闸门：window 是发言时段（不在时段内既不回消息、也不主动发言），' +
+      'proactive 是主动发言的节流（距上次多久 / 今日几条 / 不许重复）。' +
+      '两者判据全部来自磁盘配置与发送账本，不靠记忆；allowed=false 就照 reason 停手。' +
       '只读数据库，不驱动界面。',
     parameters: {
       chats: {
@@ -635,19 +636,33 @@ export function apply(ctx, config = {}) {
             ],
             additionalProperties: false,
           },
+          window: {
+            type: 'object',
+            properties: {
+              allowed: { type: 'boolean' },
+              window: { type: 'array', items: { type: 'string' } },
+              now: { type: 'string' },
+              reason: { type: 'string' },
+            },
+            required: ['allowed', 'window', 'now', 'reason'],
+            additionalProperties: false,
+          },
         },
-        required: ['count', 'messages', 'proactive'],
+        required: ['count', 'messages', 'proactive', 'window'],
         additionalProperties: false,
       },
       render: (_args, value) => {
         const gate = value.proactive;
+        const windowLine = value.window.allowed
+          ? `发言时段：可以（${value.window.window.join('–')}，现在 ${value.window.now}）`
+          : `发言时段：不可以（${value.window.reason}）——本轮不回消息，也不主动发言`;
         const gateLine = gate.allowed
           ? `主动发言：可以（今日 ${gate.todayCount}/${gate.dailyCap}${
               gate.lastPostAt ? `，上次 ${gate.lastPostAt}` : ''
             }）`
           : `主动发言：不可以（${gate.reason}）`;
         if (value.messages.length === 0) {
-          return asText([`没有新消息。${gateLine}`]);
+          return asText([`没有新消息。${windowLine}。${gateLine}`]);
         }
         const lines = [`${value.count} 条新消息：`];
         for (const message of value.messages) {
@@ -658,6 +673,7 @@ export function apply(ctx, config = {}) {
             `• ${message.timeText} ${where}: ${message.text.replace(/\s+/gu, ' ').slice(0, 300)}`,
           );
         }
+        lines.push(windowLine);
         lines.push(gateLine);
         if (gate.recentTexts.length > 0) {
           lines.push(`最近发过（别重复）：${gate.recentTexts.join(' / ')}`);
@@ -676,6 +692,13 @@ export function apply(ctx, config = {}) {
         READ_TIMEOUT_MS,
       );
       const messages = list(result?.messages).map(projectMessage);
+      const rawWindow = result?.window ?? {};
+      const window = {
+        allowed: rawWindow.allowed === true,
+        window: list(rawWindow.window).map((item) => text(item)),
+        now: text(rawWindow.now),
+        reason: text(rawWindow.reason),
+      };
       const raw = result?.proactive ?? {};
       const proactive = {
         enabled: raw.enabled === true,
@@ -689,7 +712,7 @@ export function apply(ctx, config = {}) {
         dailyCap: integer(raw.dailyCap),
         recentTexts: list(raw.recentTexts).map((item) => text(item)).filter((item) => item.length > 0),
       };
-      return { count: messages.length, messages, proactive };
+      return { count: messages.length, messages, proactive, window };
     },
   });
 
