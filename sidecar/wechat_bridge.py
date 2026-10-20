@@ -22,6 +22,7 @@
     {"id": 1, "ok": false, "error": "..."}
 """
 
+import ctypes
 import io
 import json
 import os
@@ -109,6 +110,28 @@ def _import_library():
     from wechatauto import db as db_module
 
     return db_module
+
+
+# ---------------------------------------------------------------- 空闲门控
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def user_idle_seconds():
+    """距上一次键盘或鼠标输入多少秒；系统不回答时返回 None。
+
+    取的是系统级 LastInputInfo：跨进程都算，不依赖本桥自己有没有收到事件。
+    """
+    try:
+        info = _LastInputInfo()
+        info.cbSize = ctypes.sizeof(_LastInputInfo)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        ticks = ctypes.windll.kernel32.GetTickCount()
+        # GetTickCount 49.7 天回绕一次，按 32 位取差值即可。
+        return ((ticks - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return None
 
 
 class Bridge:
@@ -331,6 +354,7 @@ class Bridge:
             "ocrEnabled": bool(_CONFIG.get("enableOcr")),
             "python": sys.version.split()[0],
             "dbDir": _CONFIG.get("dbDir"),
+            "userIdleSeconds": user_idle_seconds(),
         }
         if running:
             try:
@@ -458,6 +482,71 @@ class Bridge:
         except Exception:
             return set()
 
+    # ------------------------------------------------------------ 空闲门控
+    def _quiet_settings(self):
+        """空闲门控配置。
+
+        只在自动回复开着时生效：关掉自动回复就是「我自己在用」，这时不该拦手动发送。
+        """
+        settings = {"active": False, "idleSeconds": 60.0, "maxWaitSeconds": 120.0}
+        try:
+            with open(os.path.join(_STATE_DIR, "autoreply.json"), "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except Exception:
+            return settings
+        quiet = config.get("quiet")
+        if not isinstance(quiet, dict):
+            quiet = {}
+        settings["active"] = bool(config.get("enabled")) and quiet.get("enabled", True) is not False
+        try:
+            settings["idleSeconds"] = float(quiet.get("idleSeconds", 60))
+            settings["maxWaitSeconds"] = float(quiet.get("maxWaitSeconds", 120))
+        except (TypeError, ValueError):
+            pass
+        return settings
+
+    def _idle_gate(self, text):
+        """自动回复时先等用户空闲再发；等不到就跳过，不把窗口抢到前台。"""
+        settings = self._quiet_settings()
+        if not settings["active"]:
+            return
+        need = max(1.0, settings["idleSeconds"])
+        idle = user_idle_seconds()
+        if idle is None or idle >= need:
+            return
+        start = time.time()
+        deadline = start + max(0.0, settings["maxWaitSeconds"])
+        while idle < need and time.time() < deadline:
+            time.sleep(2.0)
+            idle = user_idle_seconds()
+            if idle is None:
+                return
+        waited = time.time() - start
+        if idle < need:
+            self._log_quiet(text, idle, waited, False)
+            raise ValueError(
+                "用户正在操作计算机（空闲 %.0fs，需要 %.0fs），本条已跳过。"
+                "不要立刻重试：记为待人工，直接结束本轮。"
+                % (idle, need)
+            )
+        self._log_quiet(text, idle, waited, True)
+
+    @staticmethod
+    def _log_quiet(text, idle, waited, sent):
+        """门控决策落盘：事后能回答「为什么这条没发」。"""
+        try:
+            line = "%s\tidle=%.0fs\twaited=%.0fs\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                idle,
+                waited,
+                "send" if sent else "skip",
+                (text or "").replace("\n", " ")[:60],
+            )
+            with open(os.path.join(_STATE_DIR, "quiet.log"), "a", encoding="utf-8") as handle:
+                handle.write(line)
+        except Exception:
+            pass
+
     def m_send(self, params):
         chat = params.get("chat")
         text = params.get("text")
@@ -483,6 +572,8 @@ class Bridge:
         }
         if dry_run:
             return dict(plan, ok=True, sent=False, note="dryRun：只解析目标，不发")
+        # 自动回复时先等用户空闲：你正在用电脑就不打断，等不到就跳过这一条。
+        self._idle_gate(text)
         started = time.time()
         gui = self.gui()
         # verify=False：库侧回读由本桥自己做（见下），避免 gui 自己起一个

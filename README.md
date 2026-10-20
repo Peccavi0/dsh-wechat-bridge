@@ -87,6 +87,9 @@ copy examples\proactive.example.json sidecar\.state\proactive.json
 | `groupMode` | `all` = 群里没 @ 也搭话；`at-only` = 只回 @ |
 | `minMinutesBetweenReplies` | 同一个会话两次搭话的最小间隔 |
 | `maxChatsPerRound` | 一轮最多回几个会话 |
+| `quiet` | 空闲门控：`{"enabled": true, "idleSeconds": 60, "maxWaitSeconds": 120}`。自动回复开着时，键鼠 60 秒没动静才发；最多等 120 秒，等不到就跳过这条，不抢前台 |
+
+`quiet` 只在 `enabled` 为 `true` 时生效。关掉自动回复后，手动 `wechat_send` 不受门控影响。
 
 ### `proactive.json`
 

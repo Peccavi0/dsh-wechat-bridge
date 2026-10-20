@@ -10,8 +10,13 @@
   "groupMode": "at-only",
   "maxChatsPerRound": 3,
   "minMinutesBetweenReplies": 15,
+  "quiet": {
+    "enabled": true,
+    "idleSeconds": 60,
+    "maxWaitSeconds": 120
+  },
   "skipIfLastMessageIsMine": true,
   "maxContextMessages": 15,
   "rules": "AUTOREPLY.md",
-  "note": "whitelist 用 username：群名带 emoji 或特殊符号时，按名字打不开会话，桥会自动换成显示名再去驱动界面。groupMode=all 表示群里没 @ 也搭话，at-only 只回 @。activeWindow 可以跨午夜。enabled=false 时巡检第一行就退出。"
+  "note": "whitelist 用 username：群名带 emoji 或特殊符号时，按名字打不开会话，桥会自动换成显示名再去驱动界面。groupMode=all 表示群里没 @ 也搭话，at-only 只回 @。activeWindow 可以跨午夜。enabled=false 时巡检第一行就退出。quiet 是空闲门控：自动回复开着时，键鼠 idleSeconds 秒没动静才发，最多等 maxWaitSeconds 秒，等不到就跳过这条；它只在 enabled=true 时生效，手动发送不受影响。"
 }
