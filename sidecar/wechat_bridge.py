@@ -42,7 +42,7 @@ _STATE_DIR = os.path.join(_HERE, ".state")
 os.makedirs(_STATE_DIR, exist_ok=True)
 
 _CONFIG = {
-    "dbDir": None,          # None = 让库自己找；本机在 E:\itchat\xwechat_files
+    "dbDir": None,          # None = 让库自己找（也可用 WECHAT_DB_DIR 指定）
     "enableOcr": False,
     "confirmSec": 12,       # 发送后回读数据库的等待上限
     "maxMessages": 100,
@@ -448,6 +448,16 @@ class Bridge:
                 break
         return {"results": results[:20], "count": min(len(results), 20)}
 
+    def _reply_whitelist(self):
+        """回复白名单（username 集合）；没配或为空表示不限制。"""
+        try:
+            with open(os.path.join(_STATE_DIR, "autoreply.json"), "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+            names = [item for item in (config.get("whitelist") or []) if isinstance(item, str)]
+            return {name.strip() for name in names if name.strip()}
+        except Exception:
+            return set()
+
     def m_send(self, params):
         chat = params.get("chat")
         text = params.get("text")
@@ -457,6 +467,15 @@ class Bridge:
             raise ValueError("必须给出非空 text")
         dry_run = bool(params.get("dryRun"))
         username, name = self.resolve_target(chat)
+        # 白名单是硬闸门：不在这份名单里的会话，默认一律拒发。
+        # 这条规则由磁盘配置驱动，不依赖模型记性——手滑也发不出去。
+        guard = self._reply_whitelist()
+        if guard and username not in guard and not params.get("allowOutside"):
+            raise ValueError(
+                "拒绝发送：%s（%s）不在回复白名单内。当前白名单只有 %s。"
+                "确需手动外发，请显式传 allowOutside=true。"
+                % (name or chat, username or "-", ", ".join(sorted(guard)))
+            )
         plan = {
             "chat": {"username": username, "name": name},
             "text": text,
@@ -588,9 +607,12 @@ class Bridge:
         self._state["seen"] = list(seen)[-400:]
         _save_state(self._state)
         collected.sort(key=lambda item: item["time"])
+        # 取**最新**的 limit 条，不是最旧的。水位已经推进到最新一条，
+        # 如果这里切掉的是最新的几条，它们就永远不会再被推送（实测丢过消息）。
+        shown = collected[-limit:] if len(collected) > limit else collected
         return {
-            "messages": collected[:limit],
-            "count": min(len(collected), limit),
+            "messages": shown,
+            "count": len(shown),
             "window": self.active_window(),
             "proactive": self.proactive_status(chats),
         }
@@ -667,6 +689,7 @@ class Bridge:
         min_gap = int(config.get("minMinutesBetween") or 90)
         daily_cap = int(config.get("dailyCap") or 6)
         recent_avoid = int(config.get("recentAvoid") or 5)
+        daily_target = int(config.get("dailyTarget") or 0)
         targets = {chat for chat in (chats or []) if isinstance(chat, str)}
         gate = self.active_window()
         in_window = gate["allowed"]
@@ -717,6 +740,29 @@ class Bridge:
         elif minutes_since is not None and minutes_since < min_gap:
             allowed, reason = False, "冷却中（距上次 %d 分钟，需 %d）" % (minutes_since, min_gap)
 
+        # 配额进度：按「时段已过多少比例」算到现在应该发了几条。
+        # 这样调用方不用自己算时间，照 behind 补即可（自己编排节奏）。
+        expected = 0
+        if daily_target > 0:
+            start_m = self._clock_minutes(gate["window"][0])
+            end_m = self._clock_minutes(gate["window"][1])
+            local = time.localtime()
+            now_m = local.tm_hour * 60 + local.tm_min
+            if start_m is not None and end_m is not None:
+                if start_m <= end_m:
+                    total = end_m - start_m
+                    elapsed = min(max(now_m - start_m, 0), total)
+                else:
+                    total = (24 * 60 - start_m) + end_m
+                    elapsed = (
+                        now_m - start_m
+                        if now_m >= start_m
+                        else (24 * 60 - start_m + now_m)
+                    )
+                    elapsed = min(max(elapsed, 0), total)
+                if total > 0:
+                    expected = int(daily_target * elapsed / total)
+
         return {
             "enabled": enabled,
             "allowed": allowed,
@@ -727,8 +773,56 @@ class Bridge:
             "minMinutesBetween": min_gap,
             "todayCount": today_count,
             "dailyCap": daily_cap,
+            "dailyTarget": daily_target,
+            "expectedByNow": expected,
+            "behind": max(0, expected - today_count),
             "recentTexts": recent,
         }
+
+    def m_peek(self, params):
+        """只看「有没有新消息」，**不推进游标**。
+
+        给常驻 watcher 用：每几秒问一次，开销只有一次数据库查询。真正推进
+        游标的还是 ``poll``——所以看和消费是两件事，不会被 peek 吃掉消息。
+        """
+        chats = params.get("chats") or []
+        db = self.db()
+        out = []
+        for chat in chats:
+            username, name = self.resolve_target(chat)
+            if not username:
+                continue
+            try:
+                rows = db.get_messages(username, limit=3)
+            except Exception as error:
+                log("peek 读取 %s 失败：%s" % (chat, error))
+                continue
+            if not rows:
+                continue
+            newest = max(rows, key=lambda item: (item.get("create_time") or 0))
+            sender = newest.get("sender_username") or ""
+            mark = float((self._state.get("watermarks") or {}).get(username) or 0)
+            last_time = float(newest.get("create_time") or 0)
+            is_group = username.endswith("@chatroom")
+            clean = self._clean_content(newest.get("content"), sender, is_group)
+            is_self = bool(sender) and sender == getattr(db, "wxid", "")
+            out.append(
+                {
+                    "username": username,
+                    "name": name,
+                    "lastTime": newest.get("create_time") or 0,
+                    "lastId": newest.get("local_id"),
+                    "lastSender": self.display_name(sender) if sender else "",
+                    "lastSenderUsername": sender,
+                    "isSelf": is_self,
+                    # unseen 才是「还没被 poll 消费过」。自己发的消息永远不算未读：
+                    # 否则 poll 消费它之前，每一轮 peek 都会重复判成新消息。
+                    "unseen": bool(mark) and last_time > mark and not is_self,
+                    "watermark": mark,
+                    "lastText": self._summarize(newest.get("type") or "", clean)[:120],
+                }
+            )
+        return {"chats": out}
 
     def m_seen(self, params):
         """只推进游标、不返回内容：用于「这条我已经知道了」的确认。"""

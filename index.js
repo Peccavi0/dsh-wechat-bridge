@@ -21,6 +21,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { appendFile, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Plugin row name used for diagnostics. */
@@ -31,6 +34,15 @@ export const inject = ['tools'];
 
 /** Sidecar 默认路径（相对本模块）。 */
 const DEFAULT_SCRIPT = fileURLToPath(new URL('./sidecar/wechat_bridge.py', import.meta.url));
+
+/** 运行时状态目录（白名单等配置就从这里读）。 */
+const STATE_DIR = fileURLToPath(new URL('./sidecar/.state/', import.meta.url));
+
+/** 唤醒节流：20 秒内只投一次提醒——够挡连发，又不至于让活跃对话卡住。 */
+const WAKE_THROTTLE_MS = 20000;
+
+/** 唤醒提醒的标题；也用它判断队列里是否已有待投递的唤醒。 */
+const WAKE_TITLE = '微信新消息唤醒';
 
 /** 从环境变量或 PATH 里试这些解释器；第一个能跑通的就用。 */
 const PYTHON_CANDIDATES = ['python', 'python3', 'py'];
@@ -306,6 +318,127 @@ export function apply(ctx, config = {}) {
   // 插件卸载时收掉子进程，避免留下一个孤儿 Python。
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => sidecar.dispose());
+  }
+
+  /* ------------------------------------------------------------ 常驻监听 */
+  // 每 5 秒问一次 sidecar「有没有新消息」：纯数据库查询，不花模型调用。
+  // 真有新消息时才用 schedule.create 投一条一次性提醒把会话唤醒——空闲时零成本。
+  const watcher = {
+    enabled: config?.wake !== false,
+    intervalMs: Math.max(3000, integer(config?.wakeIntervalMs, 5000)),
+    sessionId: text(config?.sessionId),
+    lastWakeAt: 0,
+    busy: false,
+  };
+
+  /** 读白名单：和巡检用同一份配置，避免两边不一致。 */
+  async function readWhitelist() {
+    try {
+      const raw = await readFile(join(STATE_DIR, 'autoreply.json'), 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed?.enabled === false) return [];
+      return list(parsed?.whitelist).filter((item) => typeof item === 'string');
+    } catch {
+      return [];
+    }
+  }
+
+  /** 唤醒目标会话：优先配置，其次读 dsh-bridge 当前的 activeSessionId。 */
+  async function resolveSessionId() {
+    if (watcher.sessionId.length > 0) return watcher.sessionId;
+    try {
+      const raw = await readFile(join(homedir(), '.dsh', 'dsh-bridge', 'config.json'), 'utf8');
+      const parsed = JSON.parse(raw);
+      const id = parsed?.wechat?.activeSessionId;
+      if (typeof id === 'string' && id.length > 0) return id;
+    } catch {
+      // 没有桥（纯 GUI 使用）时不做任何事
+    }
+    return '';
+  }
+
+  /** 监听日志：写文件而不是 stderr，宿主日志在别处看不到。 */
+  async function wlog(message) {
+    try {
+      const line = `[${new Date().toISOString()}] ${message}\n`;
+      await appendFile(join(STATE_DIR, 'watcher.log'), line, 'utf8');
+    } catch {
+      // 日志写不了就算了，不能因此打断监听
+    }
+  }
+
+  /** 一次检查：有新消息就投一条唤醒提醒。 */
+  async function checkOnce() {
+    if (watcher.busy) return;
+    watcher.busy = true;
+    try {
+      const whitelist = await readWhitelist();
+      if (whitelist.length === 0) return;
+      const peeked = await sidecar.request('peek', { chats: whitelist }, 30000);
+      let fresh = false;
+      for (const chat of list(peeked?.chats)) {
+        const key = text(chat.username);
+        if (key.length === 0) continue;
+        // unseen 已经排除自己发的消息；isSelf 再判一次只是防御，
+        // 避免有人改 sidecar 时把这层防护弄丢。
+        if (chat.unseen === true && chat.isSelf !== true) {
+          fresh = true;
+          await wlog(`未读消息 ${key} ${text(chat.lastSender)}: ${text(chat.lastText)}`);
+        }
+      }
+      if (!fresh) return;
+      if (Date.now() - watcher.lastWakeAt < WAKE_THROTTLE_MS) {
+        await wlog('节流中，本轮不唤醒');
+        return;
+      }
+      const scheduler = ctx.get('schedule');
+      if (scheduler === undefined) {
+        await wlog('失败：拿不到 schedule 服务');
+        return;
+      }
+      const sessionId = await resolveSessionId();
+      if (sessionId.length === 0) {
+        await wlog('失败：找不到会话 ID');
+        return;
+      }
+      // 队列里已经有一条没送达的唤醒就不再投——否则刷屏时会堆出一串空唤醒，
+      // 每条都要等一个模型回合才被消费。
+      try {
+        const pending = await scheduler.list({ sessionId });
+        const waiting = (Array.isArray(pending) ? pending : []).some(
+          (item) => item?.title === WAKE_TITLE,
+        );
+        if (waiting) {
+          await wlog('已有待投递的唤醒，本轮不重复投递');
+          return;
+        }
+      } catch {
+        // list 不可用时退化为纯节流，不影响主流程
+      }
+      await scheduler.create(sessionId, {
+        title: WAKE_TITLE,
+        prompt:
+          '微信有新消息。执行巡检：wechat_inbox（chats 传白名单）→ 按 AUTOREPLY.md 判断该不该回、怎么回。' +
+          '先做减法：单个问号、纯表情、「发狂了」「何意味」这类没信息量的消息直接跳过。' +
+          '值得回才回，长度 1-10 字，句末不加标点，不要加 [旺柴] 这类表情码。没有动作就什么都不输出。',
+        after_seconds: 2,
+      });
+      watcher.lastWakeAt = Date.now();
+      await wlog(`已唤醒会话 ${sessionId}`);
+    } catch (error) {
+      await wlog(`异常：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      watcher.busy = false;
+    }
+  }
+
+  if (watcher.enabled && typeof ctx.effect === 'function') {
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        void checkOnce();
+      }, watcher.intervalMs);
+      return () => clearInterval(timer);
+    });
   }
 
   ctx.tools.register({
@@ -620,6 +753,9 @@ export function apply(ctx, config = {}) {
               minMinutesBetween: { type: 'integer' },
               todayCount: { type: 'integer' },
               dailyCap: { type: 'integer' },
+              dailyTarget: { type: 'integer' },
+              expectedByNow: { type: 'integer' },
+              behind: { type: 'integer' },
               recentTexts: { type: 'array', items: { type: 'string' } },
             },
             required: [
@@ -632,6 +768,9 @@ export function apply(ctx, config = {}) {
               'minMinutesBetween',
               'todayCount',
               'dailyCap',
+              'dailyTarget',
+              'expectedByNow',
+              'behind',
               'recentTexts',
             ],
             additionalProperties: false,
@@ -661,8 +800,14 @@ export function apply(ctx, config = {}) {
               gate.lastPostAt ? `，上次 ${gate.lastPostAt}` : ''
             }）`
           : `主动发言：不可以（${gate.reason}）`;
+        const quotaLine =
+          gate.dailyTarget > 0
+            ? `今日配额：${gate.todayCount}/${gate.dailyTarget}，此刻应达 ${gate.expectedByNow}，${
+                gate.behind > 0 ? `还差 ${gate.behind} 条` : '已跟上进度'
+              }`
+            : '';
         if (value.messages.length === 0) {
-          return asText([`没有新消息。${windowLine}。${gateLine}`]);
+          return asText([`没有新消息。${windowLine}。${gateLine}${quotaLine ? `。${quotaLine}` : ''}`]);
         }
         const lines = [`${value.count} 条新消息：`];
         for (const message of value.messages) {
@@ -675,6 +820,7 @@ export function apply(ctx, config = {}) {
         }
         lines.push(windowLine);
         lines.push(gateLine);
+        if (quotaLine) lines.push(quotaLine);
         if (gate.recentTexts.length > 0) {
           lines.push(`最近发过（别重复）：${gate.recentTexts.join(' / ')}`);
         }
@@ -710,6 +856,9 @@ export function apply(ctx, config = {}) {
         minMinutesBetween: integer(raw.minMinutesBetween),
         todayCount: integer(raw.todayCount),
         dailyCap: integer(raw.dailyCap),
+        dailyTarget: integer(raw.dailyTarget),
+        expectedByNow: integer(raw.expectedByNow),
+        behind: integer(raw.behind),
         recentTexts: list(raw.recentTexts).map((item) => text(item)).filter((item) => item.length > 0),
       };
       return { count: messages.length, messages, proactive, window };
@@ -730,6 +879,11 @@ export function apply(ctx, config = {}) {
       dryRun: {
         type: 'boolean',
         description: 'true 时只解析目标、打印将发给谁，不发。拿不准目标时先这样试一次。',
+      },
+      allowOutside: {
+        type: 'boolean',
+        description:
+          '默认 false。目标不在回复白名单内时会被桥拒绝；只有用户明确要求发给白名单之外的会话才传 true。不要用它绕过白名单。',
       },
     },
     output: {
@@ -786,7 +940,12 @@ export function apply(ctx, config = {}) {
       if (body.length > 3000) throw new Error('单条消息最多 3000 字，请先精简');
       const result = await sidecar.request(
         'send',
-        { chat, text: body, dryRun: args?.dryRun === true },
+        {
+          chat,
+          text: body,
+          dryRun: args?.dryRun === true,
+          allowOutside: args?.allowOutside === true,
+        },
         SEND_TIMEOUT_MS,
       );
       return {
